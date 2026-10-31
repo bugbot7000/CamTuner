@@ -35,8 +35,9 @@ webcam is off until an app opens OBS Virtual Camera. It switches off again 5 sec
 the last app lets go. While the CamTuner window is open, the webcam stays on so the preview
 works; minimize to the tray to let it switch off.
 
-The Help tab shows which apps CamTuner currently sees using the virtual camera. If the
-webcam stays on with no app in use, that list names the app keeping it on.
+An app counts as using the camera only while it holds the virtual camera's video
+connection. Apps like Chrome keep the driver loaded after a tab closes; the Help tab lists
+those as "not using the camera". Changes are written to `log.txt` in `%APPDATA%\CamTuner`.
 
 Settings and a log file are stored in `%APPDATA%\CamTuner`.
 

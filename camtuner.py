@@ -215,6 +215,10 @@ def is_virtual(name):
     return "obs virtual" in name.lower()
 
 
+def log(msg):
+    print("%s  %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg), flush=True)
+
+
 def make_icon_image(size=64):
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
@@ -244,7 +248,8 @@ class UsageMonitor(threading.Thread):
 
     def __init__(self):
         super().__init__(daemon=True)
-        self.users = []
+        self.users = []      # programs counted as using the camera
+        self.details = []    # every program with the driver loaded, with its state
         self.available = usage is not None
         self.error = ""
 
@@ -252,15 +257,27 @@ class UsageMonitor(threading.Thread):
         if usage is None:
             return
         try:
-            dlls = usage.find_vcam_dll_names()
-            print("OBS virtual camera DLLs:", dlls or "(not found, using name match)")
-        except Exception:
+            det = usage.Detector()
+            log("OBS virtual camera DLLs: %s" % (sorted(det.dll_names) or "not found, using name match"))
+        except Exception as e:
             traceback.print_exc()
-            dlls = set()
+            self.error = str(e)
+            return
+        last = None
         while True:
             try:
-                self.users = usage.find_users(dlls)
+                details = det.scan()
+                for msg in det.log:
+                    log(msg)
+                det.log.clear()
+                self.details = details
+                self.users = sorted({d["program"] for d in details
+                                     if d["state"] in ("active", "unknown")})
                 self.error = ""
+                summary = sorted((d["program"], d["pid"], d["state"]) for d in details)
+                if summary != last:
+                    log("Apps with the virtual camera driver: %s" % (summary or "none"))
+                    last = summary
             except Exception as e:
                 traceback.print_exc()
                 self.error = str(e)
@@ -812,8 +829,18 @@ class App:
                 users_text = "App detection is not available on this system."
             elif self.monitor.error:
                 users_text = "App detection error: %s" % self.monitor.error
-            elif self.monitor.users:
-                users_text = "Using the virtual camera now: " + ", ".join(self.monitor.users)
+            elif self.monitor.details:
+                labels = {"active": "using the camera",
+                          "idle": "not using the camera",
+                          "unknown": "cannot check, treated as using it"}
+                # one line per program, showing its most "in use" process
+                rank = {"idle": 0, "unknown": 1, "active": 2}
+                best = {}
+                for d in self.monitor.details:
+                    if rank[d["state"]] > rank[best.get(d["program"], "idle")] \
+                            or d["program"] not in best:
+                        best[d["program"]] = d["state"]
+                users_text = "\n".join("%s: %s" % (p, labels[s]) for p, s in sorted(best.items()))
             else:
                 users_text = "No app is using the virtual camera right now."
             if visible and self.settings.get("on_demand", True):
