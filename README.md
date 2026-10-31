@@ -24,8 +24,19 @@ Alternative: copy this folder to the Windows PC and double-click `build_windows.
 1. Run CamTuner.exe and pick your real webcam at the top.
 2. Adjust the sliders. Drag the preview to pan, scroll on it to zoom.
 3. In Chrome (or any app), choose **OBS Virtual Camera** as the camera.
-4. Keep CamTuner running. Closing it stops the adjusted video.
-5. Tick **Start with Windows** on the Help tab to have it start minimized at login.
+4. Minimize CamTuner to send it to the system tray. Right-click the tray icon for
+   **Open CamTuner** and **Quit**. Quitting asks for confirmation and stops the adjusted video.
+5. Tick **Start with Windows** on the Help tab to have it start in the tray at login.
+
+## Webcam on only when needed
+
+With **Webcam on only while an app is using it** ticked (Help tab, on by default), the real
+webcam is off until an app opens OBS Virtual Camera. It switches off again 5 seconds after
+the last app lets go. While the CamTuner window is open, the webcam stays on so the preview
+works; minimize to the tray to let it switch off.
+
+The Help tab shows which apps CamTuner currently sees using the virtual camera. If the
+webcam stays on with no app in use, that list names the app keeping it on.
 
 Settings and a log file are stored in `%APPDATA%\CamTuner`.
 

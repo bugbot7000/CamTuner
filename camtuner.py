@@ -6,10 +6,14 @@ brightness, contrast, color, sharpness) and publishes the result through the
 OBS Virtual Camera driver, so Chrome and every other app can pick
 "OBS Virtual Camera" and get the adjusted picture.
 
+The real webcam is only switched on while another app is using the virtual
+camera, or while the CamTuner window is open.
+
 Requires OBS Studio installed on the PC (only for its virtual camera driver).
 """
 import json
 import os
+import queue
 import sys
 import threading
 import time
@@ -42,7 +46,7 @@ import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 import tkinter as tk  # noqa: E402
 from tkinter import ttk, messagebox  # noqa: E402
-from PIL import Image, ImageTk  # noqa: E402
+from PIL import Image, ImageDraw, ImageTk  # noqa: E402
 
 import processing as proc  # noqa: E402
 
@@ -52,13 +56,31 @@ except Exception:
     pyvirtualcam = None
     traceback.print_exc()
 
+try:
+    import pystray
+except Exception:
+    pystray = None
+    traceback.print_exc()
+
+if IS_WIN:
+    try:
+        import usage
+    except Exception:
+        usage = None
+        traceback.print_exc()
+else:
+    usage = None
+
 OUTPUT_SIZES = ["1920x1080", "1280x720", "960x540", "640x480"]
 OUT_FPS = 30
 CAPTURE_W, CAPTURE_H = 1920, 1080
 PREV_W, PREV_H = 768, 432
+USAGE_POLL_SECONDS = 1.5
+OFF_DELAY_SECONDS = 5.0  # keep the webcam on this long after the last app stops
 
 APP_DEFAULTS = dict(proc.DEFAULTS)
-APP_DEFAULTS.update({"camera_index": 0, "camera_name": "", "output": "1920x1080"})
+APP_DEFAULTS.update({"camera_index": 0, "camera_name": "", "output": "1920x1080",
+                     "on_demand": True})
 
 
 # ---------------------------------------------------------------- settings
@@ -157,7 +179,8 @@ def ensure_single_instance():
     if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
         r = tk.Tk()
         r.withdraw()
-        messagebox.showinfo(APP_NAME, "CamTuner is already running. Look for it in the taskbar.")
+        messagebox.showinfo(APP_NAME, "CamTuner is already running.\n\n"
+                                      "Look for its icon in the system tray, next to the clock.")
         r.destroy()
         sys.exit(0)
 
@@ -192,24 +215,81 @@ def is_virtual(name):
     return "obs virtual" in name.lower()
 
 
+def make_icon_image(size=64):
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    k = size / 64.0
+    blue = (37, 117, 214, 255)
+    d.rounded_rectangle((4 * k, 18 * k, 44 * k, 50 * k), radius=int(7 * k), fill=blue)
+    d.polygon([(44 * k, 28 * k), (60 * k, 19 * k), (60 * k, 49 * k), (44 * k, 40 * k)], fill=blue)
+    d.ellipse((15 * k, 25 * k, 33 * k, 43 * k), fill=(255, 255, 255, 255))
+    d.ellipse((20 * k, 30 * k, 28 * k, 38 * k), fill=blue)
+    return img
+
+
+def make_placeholder(w, h, text):
+    img = np.full((h, w, 3), 24, dtype=np.uint8)
+    scale = max(0.6, w / 1280.0)
+    thick = max(1, int(round(2 * scale)))
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+    cv2.putText(img, text, ((w - tw) // 2, (h + th) // 2), cv2.FONT_HERSHEY_SIMPLEX,
+                scale, (200, 200, 200), thick, cv2.LINE_AA)
+    return img
+
+
+# ---------------------------------------------------------------- usage monitor
+
+class UsageMonitor(threading.Thread):
+    """Polls which other programs have the virtual camera open."""
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.users = []
+        self.available = usage is not None
+        self.error = ""
+
+    def run(self):
+        if usage is None:
+            return
+        try:
+            dlls = usage.find_vcam_dll_names()
+            print("OBS virtual camera DLLs:", dlls or "(not found, using name match)")
+        except Exception:
+            traceback.print_exc()
+            dlls = set()
+        while True:
+            try:
+                self.users = usage.find_users(dlls)
+                self.error = ""
+            except Exception as e:
+                traceback.print_exc()
+                self.error = str(e)
+            time.sleep(USAGE_POLL_SECONDS)
+
+
 # ---------------------------------------------------------------- pipeline
 
 class Pipeline(threading.Thread):
-    """Capture -> process -> send to virtual camera, on a background thread."""
+    """Capture -> process -> send to virtual camera, on a background thread.
+    The real webcam is opened only while it is needed."""
 
-    def __init__(self, settings, cam_index, out_size):
+    def __init__(self, settings, cam_index, out_size, monitor):
         super().__init__(daemon=True)
         self.settings = settings
         self.cam_index = cam_index
         self.out_w, self.out_h = out_size
+        self.monitor = monitor
         self._stop_evt = threading.Event()
+        self.preview_wanted = True
+        self.camera_on = False
         self.latest = None
         self.latest_raw = None
         self.geom = None
         self.fps = 0.0
-        self.cam_status = "Starting camera..."
+        self.cam_status = "Starting..."
         self.vcam_status = ""
         self.vcam_ok = False
+        self._placeholder = make_placeholder(self.out_w, self.out_h, "Starting camera...")
 
     def stop(self):
         self._stop_evt.set()
@@ -221,17 +301,26 @@ class Pipeline(threading.Thread):
             traceback.print_exc()
             self.cam_status = "Error: %s" % e
 
-    def _run(self):
+    def _wanted(self):
+        if not self.settings.get("on_demand", True):
+            return True
+        if self.preview_wanted:
+            return True
+        return bool(self.monitor.users)
+
+    def _open_camera(self):
         backend = cv2.CAP_DSHOW if IS_WIN else cv2.CAP_ANY
         cap = cv2.VideoCapture(self.cam_index, backend)
         if not cap.isOpened():
-            self.cam_status = ("Could not open camera %d. Is another app using it?" % self.cam_index)
-            return
+            cap.release()
+            return None
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_W)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_H)
         cap.set(cv2.CAP_PROP_FPS, OUT_FPS)
+        return cap
 
+    def _run(self):
         vcam = None
         if pyvirtualcam is None:
             self.vcam_status = "Virtual camera library missing (pyvirtualcam)."
@@ -244,19 +333,57 @@ class Pipeline(threading.Thread):
                 self.vcam_status = "Output: %s (%dx%d)" % (vcam.device, self.out_w, self.out_h)
             except Exception as e:
                 traceback.print_exc()
-                self.vcam_status = ("Virtual camera not available: %s. See the Help tab." % e)
+                self.vcam_status = "Virtual camera not available: %s. See the Help tab." % e
 
+        cap = None
+        last_wanted = 0.0
+        next_open_try = 0.0
+        last_placeholder = 0.0
         lut_key, lut = None, None
         fails, frames, t0 = 0, 0, time.time()
         try:
             while not self._stop_evt.is_set():
+                now = time.time()
+                if self._wanted():
+                    last_wanted = now
+                active = (now - last_wanted) < OFF_DELAY_SECONDS
+
+                if active and cap is None and now >= next_open_try:
+                    self.cam_status = "Turning webcam on..."
+                    cap = self._open_camera()
+                    if cap is None:
+                        self.cam_status = ("Could not open camera %d. Is another app using it?"
+                                           % self.cam_index)
+                        next_open_try = time.time() + 2.0
+                    else:
+                        fails, frames, t0 = 0, 0, time.time()
+                elif not active and cap is not None:
+                    cap.release()
+                    cap = None
+                    self.fps = 0.0
+
+                self.camera_on = cap is not None
+                if cap is None:
+                    if not active:
+                        self.cam_status = "Webcam off. It turns on when an app uses OBS Virtual Camera."
+                    if vcam is not None and now - last_placeholder >= 0.1:
+                        vcam.send(self._placeholder)
+                        last_placeholder = now
+                    self.latest = self.latest_raw = self._placeholder
+                    self.geom = None
+                    time.sleep(0.05)
+                    continue
+
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     fails += 1
                     if fails > 100:
-                        self.cam_status = "Camera stopped sending frames. Press Restart."
-                        break
-                    time.sleep(0.02)
+                        self.cam_status = "Webcam stopped sending frames. Retrying..."
+                        cap.release()
+                        cap = None
+                        next_open_try = time.time() + 2.0
+                    else:
+                        time.sleep(0.02)
                     continue
                 fails = 0
                 s = dict(self.settings)
@@ -275,9 +402,12 @@ class Pipeline(threading.Thread):
                     self.fps = frames / (now - t0)
                     frames, t0 = 0, now
                     h, w = frame.shape[:2]
-                    self.cam_status = "Camera %d: %dx%d, %.0f fps" % (self.cam_index, w, h, self.fps)
+                    self.cam_status = "Webcam on: camera %d, %dx%d, %.0f fps" % (
+                        self.cam_index, w, h, self.fps)
         finally:
-            cap.release()
+            if cap is not None:
+                cap.release()
+            self.camera_on = False
             if vcam is not None:
                 vcam.close()
 
@@ -313,6 +443,15 @@ class App:
         self._shown = None
         self._prev_scale = 1.0
         self._drag = None
+        self._events = queue.Queue()
+        self._quitting = False
+
+        icon_img = make_icon_image(64)
+        self._win_icon = ImageTk.PhotoImage(icon_img)
+        root.iconphoto(True, self._win_icon)
+
+        self.monitor = UsageMonitor()
+        self.monitor.start()
 
         self.devices = list_cameras()
         self._build_ui()
@@ -325,11 +464,74 @@ class App:
             except Exception:
                 traceback.print_exc()
 
+        self.tray = self._start_tray(icon_img)
+
         self.start_pipeline()
-        root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.protocol("WM_DELETE_WINDOW", self.request_quit)
+        root.bind("<Unmap>", self.on_unmap)
         root.after(40, self.refresh)
         if start_minimized:
-            root.iconify()
+            if self.tray is not None:
+                root.withdraw()
+            else:
+                root.iconify()
+
+    # ---- tray
+
+    def _start_tray(self, image):
+        if pystray is None:
+            return None
+        try:
+            menu = pystray.Menu(
+                pystray.MenuItem("Open CamTuner", lambda icon, item: self._events.put("show"),
+                                 default=True),
+                pystray.MenuItem("Quit", lambda icon, item: self._events.put("quit")),
+            )
+            icon = pystray.Icon(APP_NAME, image, APP_NAME, menu)
+            threading.Thread(target=icon.run, daemon=True).start()
+            return icon
+        except Exception:
+            traceback.print_exc()
+            return None
+
+    def on_unmap(self, e):
+        # Minimize button: hide to the tray instead of the taskbar
+        if e.widget is self.root and self.tray is not None and not self._quitting:
+            if self.root.state() == "iconic":
+                self.root.after(10, self.root.withdraw)
+
+    def show_window(self):
+        self.root.deiconify()
+        self.root.lift()
+        try:
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+
+    def request_quit(self):
+        self.show_window()
+        if messagebox.askyesno(
+                APP_NAME,
+                "Quit CamTuner?\n\nApps using OBS Virtual Camera will stop getting your "
+                "adjusted video.\n\nTo keep it running in the background, minimize it "
+                "to the tray instead.",
+                parent=self.root):
+            self.quit()
+
+    def quit(self):
+        self._quitting = True
+        if self._save_job is not None:
+            self.root.after_cancel(self._save_job)
+        save_settings(self.settings)
+        if self.pipeline is not None:
+            self.pipeline.stop()
+            self.pipeline.join(timeout=3)
+        if self.tray is not None:
+            try:
+                self.tray.stop()
+            except Exception:
+                traceback.print_exc()
+        self.root.destroy()
 
     # ---- layout
 
@@ -409,21 +611,30 @@ class App:
 
         help_text = (
             "In Chrome or any app, choose the camera named\n"
-            "\"OBS Virtual Camera\". Keep CamTuner running.\n\n"
-            "Closing CamTuner stops the adjusted video.\n\n"
+            "\"OBS Virtual Camera\".\n\n"
+            "Minimize CamTuner to keep it running in the tray.\n"
+            "Quitting stops the adjusted video.\n\n"
             "If the virtual camera is not available:\n"
             "1. Install OBS Studio.\n"
             "2. Open OBS, click Start Virtual Camera,\n"
             "   then Stop Virtual Camera, then close OBS.\n"
-            "3. Press Restart here.\n\n"
-            "Settings are saved automatically."
+            "3. Press Restart here."
         )
         ttk.Label(helptab, text=help_text, justify="left").grid(row=0, column=0, sticky="w")
+
+        self.on_demand_var = tk.BooleanVar(value=bool(self.settings["on_demand"]))
+        ttk.Checkbutton(helptab, text="Webcam on only while an app is using it",
+                        variable=self.on_demand_var,
+                        command=lambda: self.set_value("on_demand", bool(self.on_demand_var.get()))
+                        ).grid(row=1, column=0, sticky="w", pady=(10, 0))
+        self.users_label = ttk.Label(helptab, text="", justify="left", wraplength=320)
+        self.users_label.grid(row=2, column=0, sticky="w", padx=(20, 0))
+
         self.autostart_var = tk.BooleanVar(value=get_autostart())
-        ttk.Checkbutton(helptab, text="Start with Windows (minimized)", variable=self.autostart_var,
-                        command=self.on_autostart).grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(helptab, text="Start with Windows (in the tray)", variable=self.autostart_var,
+                        command=self.on_autostart).grid(row=3, column=0, sticky="w", pady=(8, 0))
         ttk.Button(helptab, text="Open settings folder", command=self.open_data_dir
-                   ).grid(row=2, column=0, sticky="w", pady=(6, 0))
+                   ).grid(row=4, column=0, sticky="w", pady=(6, 0))
 
         ttk.Button(right, text="Reset all adjustments", command=self.reset_all
                    ).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(10, 0))
@@ -547,14 +758,38 @@ class App:
             self.pipeline.join(timeout=3)
         self._shown = None
         out = proc.parse_size(self.settings["output"])
-        self.pipeline = Pipeline(self.settings, int(self.settings["camera_index"]), out)
+        self.pipeline = Pipeline(self.settings, int(self.settings["camera_index"]), out, self.monitor)
+        self.pipeline.preview_wanted = self._window_visible()
         self.pipeline.start()
 
-    # ---- preview and mouse
+    def _window_visible(self):
+        try:
+            return self.root.state() not in ("iconic", "withdrawn")
+        except tk.TclError:
+            return False
+
+    # ---- periodic update
 
     def refresh(self):
+        if self._quitting:
+            return
+        while True:
+            try:
+                ev = self._events.get_nowait()
+            except queue.Empty:
+                break
+            if ev == "show":
+                self.show_window()
+            elif ev == "quit":
+                self.request_quit()
+                if self._quitting:
+                    return
+
         p = self.pipeline
-        if p is not None and self.root.state() != "iconic":
+        visible = self._window_visible()
+        if p is not None:
+            p.preview_wanted = visible
+        if p is not None and visible:
             frame = p.latest_raw if self.show_orig.get() else p.latest
             if frame is not None and frame is not self._shown:
                 self._shown = frame
@@ -572,7 +807,21 @@ class App:
                     self._prev_scale = sc
             parts = [p.cam_status, p.vcam_status]
             self.status.configure(text="   |   ".join(x for x in parts if x))
+
+            if not self.monitor.available:
+                users_text = "App detection is not available on this system."
+            elif self.monitor.error:
+                users_text = "App detection error: %s" % self.monitor.error
+            elif self.monitor.users:
+                users_text = "Using the virtual camera now: " + ", ".join(self.monitor.users)
+            else:
+                users_text = "No app is using the virtual camera right now."
+            if visible and self.settings.get("on_demand", True):
+                users_text += "\n(The webcam stays on while this window is open.)"
+            self.users_label.configure(text=users_text)
         self.root.after(40, self.refresh)
+
+    # ---- mouse
 
     def on_press(self, e):
         self._drag = (e.x, e.y)
@@ -595,15 +844,6 @@ class App:
     def on_wheel(self, e):
         steps = e.delta / 120.0
         self.set_value("zoom", float(self.settings["zoom"]) * (1.1 ** steps))
-
-    def on_close(self):
-        if self._save_job is not None:
-            self.root.after_cancel(self._save_job)
-        save_settings(self.settings)
-        if self.pipeline is not None:
-            self.pipeline.stop()
-            self.pipeline.join(timeout=3)
-        self.root.destroy()
 
 
 def main():

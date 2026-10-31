@@ -22,7 +22,7 @@ jobs:
       - name: Build exe
         run: >
           pyinstaller --noconfirm --onefile --windowed --name CamTuner
-          --collect-all pyvirtualcam --collect-all pygrabber
+          --collect-all pyvirtualcam --collect-all pygrabber --collect-all pystray --hidden-import usage
           camtuner.py
 
       - uses: actions/upload-artifact@v4
